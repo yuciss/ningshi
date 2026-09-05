@@ -18,6 +18,10 @@ Ningshi (凝时) is a KernelSU module. It helps you scroll less and keeps apps f
 - KernelSU, arm64 device
 - Kernel with kprobe enabled and the `binder_transaction` symbol in `/proc/kallsyms`
 
+## Screenshots
+
+![Screenshot 1](screenshots/screenshot-1.webp) ![Screenshot 2](screenshots/screenshot-2.webp)
+
 ## Development
 
 ### Layout
@@ -34,12 +38,11 @@ Ningshi (凝时) is a KernelSU module. It helps you scroll less and keeps apps f
 │       ├── index.html
 │       └── config.json
 ├── daemon/                 # core program (Rust daemon + eBPF)
-│   ├── src/                # engine, gate, detection, notify, socket, ...
+│   ├── src/                # engine, gate, detection, socket, ...
 │   ├── bpf/gate.bpf.c      # kprobe / kretprobe hooks
 │   ├── build.sh            # build BPF + cross-compile the daemon
 │   └── rules.example.json  # example rules
-├── scripts/package.sh      # one-shot build + package
-└── docs/
+└── scripts/package.sh      # one-shot build + package
 ```
 
 ### Build
@@ -76,7 +79,7 @@ ningshi clear_log
 
 ### Rules file
 
-`/data/adb/modules/ningshi/rules.json` is the single data contract shared by the WebUI and the daemon; see `daemon/rules.example.json`. Unknown fields are ignored when parsing, for forward compatibility.
+`/data/adb/ningshi/rules.json` is the single data contract shared by the WebUI and the daemon; see `daemon/rules.example.json`. Unknown fields are ignored when parsing, for forward compatibility.
 
 ### Key design
 

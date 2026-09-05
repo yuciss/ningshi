@@ -34,12 +34,11 @@
 │       ├── index.html
 │       └── config.json
 ├── daemon/                 # 核心程序（Rust daemon + eBPF）
-│   ├── src/                # 引擎、门钩、检测、通知、socket 等
+│   ├── src/                # 引擎、门钩、检测、socket 等
 │   ├── bpf/gate.bpf.c      # kprobe / kretprobe 钩子
 │   ├── build.sh            # 编译 BPF + 交叉编译 daemon
 │   └── rules.example.json  # 规则示例
-├── scripts/package.sh      # 一键编译 + 打包
-└── docs/
+└── scripts/package.sh      # 一键编译 + 打包
 ```
 
 ### 构建
@@ -76,7 +75,7 @@ ningshi clear_log
 
 ### 规则文件
 
-`/data/adb/modules/ningshi/rules.json` 是 WebUI 与 daemon 共用的唯一数据契约，字段见 `daemon/rules.example.json`；解析时未知字段会被忽略，便于向前兼容。
+`/data/adb/ningshi/rules.json` 是 WebUI 与 daemon 共用的唯一数据契约，字段见 `daemon/rules.example.json`；解析时未知字段会被忽略，便于向前兼容。
 
 ### 关键设计
 
