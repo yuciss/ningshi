@@ -1,0 +1,10 @@
+# Normalize line endings: LF in the repo, and keep LF on checkout for files
+# that run on device or are compiled (CRLF breaks Android shell scripts).
+* text=auto
+*.sh text eol=lf
+*.rs text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.prop text eol=lf
+*.json text eol=lf
+*.html text eol=lf

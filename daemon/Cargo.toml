@@ -1,0 +1,21 @@
+[package]
+name = "ningshi"
+version = "0.3.0"
+edition = "2021"
+
+[[bin]]
+name = "ningshi"
+path = "src/main.rs"
+
+[dependencies]
+aya = "0.14"
+libc = "0.2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+
+[profile.release]
+opt-level = 2
+lto = true
+strip = true

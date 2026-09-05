@@ -1,0 +1,12 @@
+# Build artifacts
+/module/bin/
+target/
+*.zip
+
+# Runtime files (generated on device)
+rules.json
+state.json
+*.log
+
+# Obsolete proof-of-concept
+/p0/

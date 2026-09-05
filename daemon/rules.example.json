@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "settings": {
+    "timezone": "auto",
+    "language": "auto",
+    "clear_log_on_boot": false
+  },
+  "apps": {
+    "0:com.example.game": {
+      "enabled": true,
+      "always_on": false,
+      "lock_block": false,
+      "time_windows": {
+        "mode": "allow",
+        "windows": [
+          { "start": "20:00", "end": "22:00" }
+        ]
+      },
+      "duration": {
+        "limit_minutes": 30,
+        "freeze_minutes": 120,
+        "scope": "foreground"
+      }
+    }
+  },
+  "groups": {
+    "g_social": {
+      "name": "Social",
+      "enabled": true,
+      "shared_pool": true,
+      "members": ["0:com.tencent.mm", "0:com.sina.weibo", "10:com.tencent.mm"],
+      "always_on": false,
+      "lock_block": false,
+      "time_windows": {
+        "mode": "block",
+        "windows": [
+          { "start": "17:00", "end": "23:59" },
+          { "start": "00:00", "end": "05:00" }
+        ]
+      },
+      "duration": {
+        "limit_minutes": 60,
+        "freeze_minutes": 0,
+        "scope": "foreground"
+      }
+    }
+  }
+}

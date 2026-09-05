@@ -1,0 +1,5 @@
+{
+  "title": "凝时 ningshi",
+  "exitConfirm": false,
+  "contentSecurityPolicy": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' ksu: data:; font-src 'self' data:"
+}
