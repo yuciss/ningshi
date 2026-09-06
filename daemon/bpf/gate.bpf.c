@@ -74,8 +74,11 @@ int gate_binder_entry(struct pt_regs *ctx)
     if (!blocked || !*blocked)
         return 0;
 
-    // First argument: struct binder_transaction_data*, offset 0 = target.handle.
-    void *tr = (void *)ctx->regs[0];
+    // The signature is binder_transaction(proc, thread, tr, reply,
+    // extra_buffers_size), so the binder_transaction_data* is the THIRD
+    // argument: regs[2] on arm64 (regs[0] is the proc pointer). Offset 0 of
+    // tr is target.handle.
+    void *tr = (void *)ctx->regs[2];
     __u32 handle = 0;
     bpf_probe_read(&handle, sizeof(handle), tr);
     if (handle == 0)
