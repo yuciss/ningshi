@@ -126,8 +126,14 @@ impl Gate {
             // slow background launch never delays a foreground one.
             let mut pending: Vec<(i32, u32, u32, std::time::Instant)> = Vec::new();
             loop {
-                // One bounded receive, then drain anything already queued.
-                match kill_rx.recv_timeout(std::time::Duration::from_millis(POLL_MS)) {
+                // Receive: block when idle (zero wakeups while nothing is
+                // pending), bounded poll while a kill is being waited on.
+                let recv_result = if pending.is_empty() {
+                    kill_rx.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+                } else {
+                    kill_rx.recv_timeout(std::time::Duration::from_millis(POLL_MS))
+                };
+                match recv_result {
                     Ok((pid, uid)) => {
                         if let Some(pidfd) = pidfd_open(pid) {
                             pending.push((pidfd, pid, uid, std::time::Instant::now()));
@@ -140,8 +146,9 @@ impl Gate {
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        // Gate thread dropped the sender: finish pending kills
-                        // so shutdown never leaves a blocked app running.
+                        // Sender dropped. Finish any pending kills right away
+                        // (shutdown must not leave a blocked app running), then
+                        // exit.
                         for (pidfd, _, uid, _) in pending.drain(..) {
                             pidfd_kill(pidfd);
                             if let Ok(mut c) = counters.lock() {
