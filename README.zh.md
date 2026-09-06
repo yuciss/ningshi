@@ -2,7 +2,7 @@
 
 # 凝时
 
-**版本 0.3.5**
+**版本 0.3.6**
 
 凝时（Ningshi）是一个 KernelSU 模块。它可以帮你少刷手机，或者防止应用偷跑。
 
@@ -69,7 +69,7 @@ cd daemon
 
 ```bash
 adb push module/bin/ningshi /data/local/tmp/
-adb shell su -c 'pkill ningshi; sleep 1; cp /data/local/tmp/ningshi /data/adb/modules/ningshi/bin/ningshi && chmod 755 /data/adb/modules/ningshi/bin/ningshi'
+adb shell su -c 'pkill -9 ningshi; sleep 1; cp /data/local/tmp/ningshi /data/adb/modules/ningshi/bin/ningshi && chmod 755 /data/adb/modules/ningshi/bin/ningshi'
 # watchdog 5 秒后自动拉起新二进制
 ```
 
@@ -89,6 +89,6 @@ ningshi clear_log
 
 ### 关键设计
 
-- **拦截**：kprobe 在 `binder_transaction` 入口按 uid 判黑，第一个 handle≠0 的事务（`attachApplication`）标记 tgid，kretprobe 返回时发 `SIGKILL`。
+- **拦截**：kprobe 在 `binder_transaction` 入口按 uid 判黑，第一个 handle≠0 的事务（`attachApplication`）标记 tgid，kretprobe 发出事件；用户态 killer 等到进程成为前台（`oom_score_adj == 0`，即 attach 握手完成）后，经 pidfd 发送 `SIGKILL`——被回收的 pid 无法再让击杀落错目标。
 - **检测**：前台 / 屏状态 / 包名→uid 全部读内核文件系统（cpuset / DRM / `packages.list`）。
 - **失败方向**：所有检测失败时一律放行。周期性清扫兜底门钩漏掉的残留进程。

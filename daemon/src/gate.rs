@@ -31,6 +31,31 @@ fn read_oom_score_adj(pid: u32) -> Option<i32> {
         .and_then(|s| s.trim().parse::<i32>().ok())
 }
 
+/// Open a pidfd for a pid, or None when the process already exited (or pidfd
+/// is unavailable). The fd pins the exact process so it can be signalled
+/// safely even after the pid number is recycled. pidfd needs Linux 5.3+,
+/// always present on the 5.10/6.1 GKI kernels this module targets. libc for
+/// musl does not export pidfd_open, so go through the raw syscall.
+fn pidfd_open(pid: u32) -> Option<i32> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as usize, 0usize) };
+    if fd >= 0 { Some(fd as i32) } else { None }
+}
+
+/// Send SIGKILL through a pidfd, then close it. Targets the exact process the
+/// fd refers to; a recycled pid number cannot redirect this.
+fn pidfd_kill(pidfd: i32) {
+    unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd as usize,
+            libc::SIGKILL as usize,
+            0usize, // siginfo_t* NULL
+            0usize, // flags
+        );
+        libc::close(pidfd);
+    }
+}
+
 pub struct Gate {
     /// Holds the BPF object so kprobe links stay attached while the daemon lives.
     _bpf: Ebpf,
@@ -87,28 +112,38 @@ impl Gate {
         // The timeout only catches background launches that never reach
         // foreground. Polling runs only while a pid is pending, so idle cost
         // is zero.
+        //
+        // Every pending pid is pinned with a pidfd: SIGKILL is sent through
+        // pidfd_send_signal, so a recycled pid number can never redirect the
+        // kill onto an innocent process. poll(pidfd) detects the original
+        // process exiting, which also stops us from reading a recycled pid's
+        // oom_score_adj.
         const POLL_MS: u64 = 5;
         const TIMEOUT_MS: u64 = 300;
         let (kill_tx, kill_rx) = std::sync::mpsc::channel::<(u32, u32)>();
         let killer = std::thread::spawn(move || {
-            // Pending (pid, uid, queued_at). Polled round-robin so a slow
-            // background launch never delays a foreground one.
-            let mut pending: Vec<(u32, u32, std::time::Instant)> = Vec::new();
+            // Pending (pidfd, pid, uid, queued_at). Polled round-robin so a
+            // slow background launch never delays a foreground one.
+            let mut pending: Vec<(i32, u32, u32, std::time::Instant)> = Vec::new();
             loop {
                 // One bounded receive, then drain anything already queued.
                 match kill_rx.recv_timeout(std::time::Duration::from_millis(POLL_MS)) {
                     Ok((pid, uid)) => {
-                        pending.push((pid, uid, std::time::Instant::now()));
+                        if let Some(pidfd) = pidfd_open(pid) {
+                            pending.push((pidfd, pid, uid, std::time::Instant::now()));
+                        }
                         while let Ok((pid, uid)) = kill_rx.try_recv() {
-                            pending.push((pid, uid, std::time::Instant::now()));
+                            if let Some(pidfd) = pidfd_open(pid) {
+                                pending.push((pidfd, pid, uid, std::time::Instant::now()));
+                            }
                         }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                         // Gate thread dropped the sender: finish pending kills
                         // so shutdown never leaves a blocked app running.
-                        for (pid, uid, _) in pending.drain(..) {
-                            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                        for (pidfd, _, uid, _) in pending.drain(..) {
+                            pidfd_kill(pidfd);
                             if let Ok(mut c) = counters.lock() {
                                 *c.entry(uid).or_insert(0) += 1;
                             }
@@ -118,12 +153,21 @@ impl Gate {
                 }
                 let mut i = 0;
                 while i < pending.len() {
-                    let (pid, uid, started) = pending[i];
+                    let (pidfd, pid, uid, started) = pending[i];
+                    // The pidfd becomes readable when the original process
+                    // exits: drop it (never kill a recycled pid).
+                    let mut pfd = libc::pollfd { fd: pidfd, events: libc::POLLIN, revents: 0 };
+                    let pr = unsafe { libc::poll(&mut pfd, 1, 0) };
+                    if pr > 0 && (pfd.revents & libc::POLLIN) != 0 {
+                        unsafe { libc::close(pidfd) };
+                        pending.swap_remove(i);
+                        continue;
+                    }
                     match read_oom_score_adj(pid) {
                         Some(0) => {
                             // Foreground and attach-complete: kill now, before
                             // the first frame is drawn.
-                            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                            pidfd_kill(pidfd);
                             log(&format!("[gate] kill pid={pid} uid={uid} (foreground)"));
                             if let Ok(mut c) = counters.lock() {
                                 *c.entry(uid).or_insert(0) += 1;
@@ -132,13 +176,14 @@ impl Gate {
                         }
                         None => {
                             // Already exited before we could kill it.
+                            unsafe { libc::close(pidfd) };
                             pending.swap_remove(i);
                         }
                         Some(_) if started.elapsed()
                             >= std::time::Duration::from_millis(TIMEOUT_MS) =>
                         {
                             // Background launch: never became foreground, kill it.
-                            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                            pidfd_kill(pidfd);
                             log(&format!("[gate] kill pid={pid} uid={uid} (timeout)"));
                             if let Ok(mut c) = counters.lock() {
                                 *c.entry(uid).or_insert(0) += 1;

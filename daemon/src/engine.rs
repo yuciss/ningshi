@@ -78,7 +78,7 @@ pub struct Engine {
     last_tick: Option<u64>,
     /// last tick date, detects day rollover
     last_day: Option<NaiveDate>,
-    /// configured timezone offset east in seconds (None = device local time)
+    /// configured timezone offset east in seconds (None = UTC fallback)
     tz_secs: Option<i32>,
     /// last state save epoch seconds
     last_save: u64,
@@ -362,8 +362,12 @@ impl Engine {
             if should_block && !was {
                 let n = clear::kill_uid(uid);
                 log(&format!("[engine] block uid={uid} (clear {n})"));
-                if let Ok(mut c) = self.kill_count.lock() {
-                    *c.entry(uid).or_insert(0) += 1;
+                // Count only real interceptions: a transition onto the block
+                // list with nothing running is not a kill.
+                if n > 0 {
+                    if let Ok(mut c) = self.kill_count.lock() {
+                        *c.entry(uid).or_insert(0) += 1;
+                    }
                 }
             }
             if should_block != was {
@@ -690,11 +694,13 @@ fn parse_hhmm(s: &str) -> u32 {
     h * 60 + m
 }
 
-/// Parse timezone setting: "auto" or "" = device local, "UTC+N"/"UTC-N" = fixed offset.
+/// Parse the timezone setting. Only fixed "UTC" / "UTC+N" / "UTC-N" offsets
+/// are supported (no device-local "auto", no DST); any other value falls back
+/// to UTC. The installer bakes the detected offset in at install time.
 fn parse_tz(value: &str) -> Option<i32> {
     let v = value.trim();
-    if v.is_empty() || v.eq_ignore_ascii_case("auto") {
-        return None;
+    if v == "UTC" {
+        return Some(0);
     }
     let n: i32 = v.strip_prefix("UTC")?.parse().ok()?;
     Some(n * 3600)

@@ -24,10 +24,10 @@ pub struct Rules {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Settings {
-    /// "auto" (device) or "UTC+N"/"UTC-N" fixed offset.
+    /// Fixed UTC offset: "UTC" or "UTC+N"/"UTC-N". No "auto"/DST.
     #[serde(default = "d_timezone")]
     pub timezone: String,
-    /// "auto" (system), "zh", "en".
+    /// UI language: "zh" or "en".
     #[serde(default = "d_language")]
     pub language: String,
     /// Truncate the log when the module (re)starts.

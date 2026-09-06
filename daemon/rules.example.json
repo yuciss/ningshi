@@ -1,8 +1,8 @@
 {
   "version": 1,
   "settings": {
-    "timezone": "auto",
-    "language": "auto",
+    "timezone": "UTC+8",
+    "language": "zh",
     "clear_log_on_boot": false
   },
   "apps": {

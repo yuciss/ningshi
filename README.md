@@ -2,7 +2,7 @@
 
 # Ningshi
 
-**Version 0.3.5**
+**Version 0.3.6**
 
 Ningshi (凝时) is a KernelSU module. It helps you scroll less and keeps apps from running in the background.
 
@@ -73,7 +73,7 @@ cd daemon
 
 ```bash
 adb push module/bin/ningshi /data/local/tmp/
-adb shell su -c 'pkill ningshi; sleep 1; cp /data/local/tmp/ningshi /data/adb/modules/ningshi/bin/ningshi && chmod 755 /data/adb/modules/ningshi/bin/ningshi'
+adb shell su -c 'pkill -9 ningshi; sleep 1; cp /data/local/tmp/ningshi /data/adb/modules/ningshi/bin/ningshi && chmod 755 /data/adb/modules/ningshi/bin/ningshi'
 # the watchdog restarts the new binary ~5s later
 ```
 
@@ -93,6 +93,6 @@ ningshi clear_log
 
 ### Key design
 
-- **Interception**: the kprobe checks the uid at `binder_transaction` entry; the first non-zero-handle transaction (`attachApplication`) marks the tgid, and the kretprobe sends `SIGKILL` on return.
+- **Interception**: the kprobe checks the uid at `binder_transaction` entry; the first non-zero-handle transaction (`attachApplication`) marks the tgid, and the kretprobe emits an event. The userspace killer waits for the process to become the foreground app (`oom_score_adj == 0`, i.e. the attach handshake is complete) and then sends `SIGKILL` through a pidfd, so a recycled pid can never redirect the kill.
 - **Detection**: foreground / screen state / package-to-uid are read from kernel filesystems (cpuset / DRM / `packages.list`).
 - **Fail-open**: every failed detection lets the app through. A periodic sweep covers any process the gate missed.
