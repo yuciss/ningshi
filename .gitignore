@@ -2,6 +2,7 @@
 /module/bin/
 target/
 *.zip
+/daemon/bpf/*.o
 
 # Runtime files (generated on device)
 rules.json

@@ -85,6 +85,9 @@ impl Gate {
                     break; // wake pipe: shutdown
                 }
                 if (pfds[0].revents & libc::POLLIN) != 0 {
+                    // Give system_server ~10ms to process the attach reply before
+                    // the death notification, so the window closes instantly.
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                     while let Some(item) = events.next() {
                         if item.len() < 8 {
                             continue;
