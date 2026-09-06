@@ -2,10 +2,9 @@
 // - kprobe on binder_transaction entry: current uid is blocked AND target
 //   handle != 0 (the first handle != 0 transaction of a new process is
 //   attachApplication) -> mark the tgid pending.
-// - kretprobe on binder_transaction exit: marked -> bpf_send_signal(SIGKILL)
-//   in the kernel (attach has completed, no black screen), plus a ringbuf
-//   event for statistics.
-// The userspace thread only counts kills; it no longer sends the signal.
+// - kretprobe on binder_transaction exit: marked -> push ringbuf event.
+// - The userspace thread sends SIGKILL from outside the binder driver, so
+//   system_server gets the death notification promptly: no black screen.
 
 use std::collections::HashMap as StdHashMap;
 use std::convert::TryInto;
@@ -69,8 +68,9 @@ impl Gate {
 
         let counters = Arc::clone(&kill_count);
         let handle = std::thread::spawn(move || {
-            // The signal is now sent in the kernel; this thread only counts.
-            // One spawn may emit several events while dying, so count once.
+            // Kill from userspace (outside the binder driver) so the death
+            // notification reaches system_server promptly: no black screen.
+            // One spawn may emit several events while dying; kill and count once.
             let mut recent: StdHashMap<u32, std::time::Instant> = StdHashMap::new();
             let mut pfds = [
                 libc::pollfd { fd: ring_fd, events: libc::POLLIN, revents: 0 },
@@ -97,6 +97,7 @@ impl Gate {
                             }
                         }
                         log(&format!("[gate] blocked spawn pid={pid} uid={uid}"));
+                        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
                         if let Ok(mut c) = counters.lock() {
                             *c.entry(uid).or_insert(0) += 1;
                         }
