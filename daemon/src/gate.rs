@@ -3,10 +3,10 @@
 //   handle != 0 (the first handle != 0 transaction of a new process is
 //   attachApplication) -> mark the tgid pending.
 // - kretprobe on binder_transaction exit: marked -> push ringbuf event.
-// - A gate thread drains the ring buffer and hands each kill to a small worker
-//   pool. Every kill gets its own ~10ms deadline so system_server can finish the
-//   attach reply before the death notification (no black screen), and concurrent
-//   launches are killed in parallel without ever blocking the drain.
+// - A gate thread drains the ring buffer and queues each kill to a single
+//   killer thread. Every kill gets its own ~10ms deadline so system_server can
+//   finish the attach reply before the death notification (no black screen),
+//   without ever blocking the drain.
 
 use std::collections::HashMap as StdHashMap;
 use std::convert::TryInto;
@@ -70,33 +70,27 @@ impl Gate {
 
         let counters = Arc::clone(&kill_count);
 
-        // Kill worker pool: killing is independent of the drain loop and runs in
-        // parallel. Each job carries its own deadline, so a burst of launches is
-        // handled concurrently and the ring buffer drain is never blocked.
-        const KILL_WORKERS: usize = 4;
+        // Single killer thread: kill jobs are queued and executed one at a time,
+        // each with its own deadline. The drain loop never sleeps, so the ring
+        // buffer is never blocked; SIGKILL is fast enough that one worker keeps
+        // up with any burst.
         const KILL_DELAY_MS: u64 = 10;
-        let mut senders: Vec<std::sync::mpsc::Sender<(std::time::Instant, u32, u32)>> = Vec::new();
-        let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
-        for _ in 0..KILL_WORKERS {
-            let (tx, rx) = std::sync::mpsc::channel::<(std::time::Instant, u32, u32)>();
-            senders.push(tx);
-            let counters = Arc::clone(&counters);
-            workers.push(std::thread::spawn(move || {
-                // Sleep until the deadline (system_server has time to finish the
-                // attach), then kill from userspace: no black screen. Exits once
-                // the gate thread drops all senders on shutdown.
-                while let Ok((deadline, pid, uid)) = rx.recv() {
-                    let now = std::time::Instant::now();
-                    if deadline > now {
-                        std::thread::sleep(deadline.duration_since(now));
-                    }
-                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-                    if let Ok(mut c) = counters.lock() {
-                        *c.entry(uid).or_insert(0) += 1;
-                    }
+        let (kill_tx, kill_rx) = std::sync::mpsc::channel::<(std::time::Instant, u32, u32)>();
+        let killer = std::thread::spawn(move || {
+            // Sleep until the deadline (system_server has time to finish the
+            // attach), then kill from userspace: no black screen. Exits once
+            // the gate thread drops the sender on shutdown.
+            while let Ok((deadline, pid, uid)) = kill_rx.recv() {
+                let now = std::time::Instant::now();
+                if deadline > now {
+                    std::thread::sleep(deadline.duration_since(now));
                 }
-            }));
-        }
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                if let Ok(mut c) = counters.lock() {
+                    *c.entry(uid).or_insert(0) += 1;
+                }
+            }
+        });
 
         let handle = std::thread::spawn(move || {
             // One spawn may emit several events while dying; kill and count once.
@@ -105,7 +99,6 @@ impl Gate {
                 libc::pollfd { fd: ring_fd, events: libc::POLLIN, revents: 0 },
                 libc::pollfd { fd: read_fd, events: libc::POLLIN, revents: 0 },
             ];
-            let mut next = 0usize;
             loop {
                 let r = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
                 if r <= 0 {
@@ -115,9 +108,9 @@ impl Gate {
                     break; // wake pipe: shutdown
                 }
                 if (pfds[0].revents & libc::POLLIN) != 0 {
-                    // Drain immediately and hand each kill to a worker with its
-                    // own ~10ms deadline: system_server gets the attach reply in,
-                    // and concurrent launches never block one another.
+                    // Drain immediately and queue each kill with its own ~10ms
+                    // deadline: system_server gets the attach reply in, and the
+                    // drain is never blocked by a sleep.
                     while let Some(item) = events.next() {
                         if item.len() < 8 {
                             continue;
@@ -132,8 +125,7 @@ impl Gate {
                         log(&format!("[gate] blocked spawn pid={pid} uid={uid}"));
                         let deadline = std::time::Instant::now()
                             + std::time::Duration::from_millis(KILL_DELAY_MS);
-                        senders[next % KILL_WORKERS].send((deadline, pid, uid)).ok();
-                        next += 1;
+                        kill_tx.send((deadline, pid, uid)).ok();
                         recent.insert(pid, std::time::Instant::now());
                         if recent.len() > 64 {
                             recent.retain(|_, t| t.elapsed().as_secs() < 10);
@@ -141,11 +133,9 @@ impl Gate {
                     }
                 }
             }
-            // Drop senders so workers observe the disconnect and exit, then join.
-            drop(senders);
-            for w in workers {
-                let _ = w.join();
-            }
+            // Drop the sender so the killer observes the disconnect, then join it.
+            drop(kill_tx);
+            let _ = killer.join();
             unsafe { libc::close(read_fd) };
         });
 

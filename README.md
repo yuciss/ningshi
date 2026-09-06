@@ -2,7 +2,7 @@
 
 # Ningshi
 
-**Version 0.3.3**
+**Version 0.3.4**
 
 Ningshi (凝时) is a KernelSU module. It helps you scroll less and keeps apps from running in the background.
 
