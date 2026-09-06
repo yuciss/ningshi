@@ -3,10 +3,11 @@
 //   handle != 0 (the first handle != 0 transaction of a new process is
 //   attachApplication) -> mark the tgid pending.
 // - kretprobe on binder_transaction exit: marked -> push ringbuf event.
-// - A gate thread drains the ring buffer and queues each kill to a single
-//   killer thread. Every kill gets its own ~10ms deadline so system_server can
-//   finish the attach reply before the death notification (no black screen),
-//   without ever blocking the drain.
+// - A gate thread drains the ring buffer and queues each pid to a single
+//   killer thread. The killer waits for the pid's oom_score_adj to become 0
+//   (attach handshake done -> the process is foreground) and only then sends
+//   SIGKILL from userspace: no black screen, no fixed delay. A 300ms timeout
+//   catches background launches that never reach foreground.
 
 use std::collections::HashMap as StdHashMap;
 use std::convert::TryInto;
@@ -18,6 +19,17 @@ use aya::programs::KProbe;
 use aya::{include_bytes_aligned, Ebpf, EbpfLoader};
 
 use crate::config::log;
+
+/// Read a pid's oom_score_adj (None when the pid already exited). A value of
+/// 0 means the process is the foreground app (FOREGROUND_APP_ADJ). Verified on
+/// device: at the attach boundary the value is still -1000 (inherited from
+/// zygote), and it flips to 0 a few ms later once the attach handshake is
+/// complete -- so 0 is a real, later, deterministic "safe to kill" signal.
+fn read_oom_score_adj(pid: u32) -> Option<i32> {
+    std::fs::read_to_string(format!("/proc/{pid}/oom_score_adj"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+}
 
 pub struct Gate {
     /// Holds the BPF object so kprobe links stay attached while the daemon lives.
@@ -70,24 +82,73 @@ impl Gate {
 
         let counters = Arc::clone(&kill_count);
 
-        // Single killer thread: kill jobs are queued and executed one at a time,
-        // each with its own deadline. The drain loop never sleeps, so the ring
-        // buffer is never blocked; SIGKILL is fast enough that one worker keeps
-        // up with any burst.
-        const KILL_DELAY_MS: u64 = 10;
-        let (kill_tx, kill_rx) = std::sync::mpsc::channel::<(std::time::Instant, u32, u32)>();
+        // Single killer thread: pids are killed the moment their oom_score_adj
+        // hits 0 (attach handshake done -> foreground), never on a fixed delay.
+        // The timeout only catches background launches that never reach
+        // foreground. Polling runs only while a pid is pending, so idle cost
+        // is zero.
+        const POLL_MS: u64 = 5;
+        const TIMEOUT_MS: u64 = 300;
+        let (kill_tx, kill_rx) = std::sync::mpsc::channel::<(u32, u32)>();
         let killer = std::thread::spawn(move || {
-            // Sleep until the deadline (system_server has time to finish the
-            // attach), then kill from userspace: no black screen. Exits once
-            // the gate thread drops the sender on shutdown.
-            while let Ok((deadline, pid, uid)) = kill_rx.recv() {
-                let now = std::time::Instant::now();
-                if deadline > now {
-                    std::thread::sleep(deadline.duration_since(now));
+            // Pending (pid, uid, queued_at). Polled round-robin so a slow
+            // background launch never delays a foreground one.
+            let mut pending: Vec<(u32, u32, std::time::Instant)> = Vec::new();
+            loop {
+                // One bounded receive, then drain anything already queued.
+                match kill_rx.recv_timeout(std::time::Duration::from_millis(POLL_MS)) {
+                    Ok((pid, uid)) => {
+                        pending.push((pid, uid, std::time::Instant::now()));
+                        while let Ok((pid, uid)) = kill_rx.try_recv() {
+                            pending.push((pid, uid, std::time::Instant::now()));
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        // Gate thread dropped the sender: finish pending kills
+                        // so shutdown never leaves a blocked app running.
+                        for (pid, uid, _) in pending.drain(..) {
+                            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                            if let Ok(mut c) = counters.lock() {
+                                *c.entry(uid).or_insert(0) += 1;
+                            }
+                        }
+                        break;
+                    }
                 }
-                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-                if let Ok(mut c) = counters.lock() {
-                    *c.entry(uid).or_insert(0) += 1;
+                let mut i = 0;
+                while i < pending.len() {
+                    let (pid, uid, started) = pending[i];
+                    match read_oom_score_adj(pid) {
+                        Some(0) => {
+                            // Foreground and attach-complete: kill now, before
+                            // the first frame is drawn.
+                            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                            log(&format!("[gate] kill pid={pid} uid={uid} (foreground)"));
+                            if let Ok(mut c) = counters.lock() {
+                                *c.entry(uid).or_insert(0) += 1;
+                            }
+                            pending.swap_remove(i);
+                        }
+                        None => {
+                            // Already exited before we could kill it.
+                            pending.swap_remove(i);
+                        }
+                        Some(_) if started.elapsed()
+                            >= std::time::Duration::from_millis(TIMEOUT_MS) =>
+                        {
+                            // Background launch: never became foreground, kill it.
+                            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                            log(&format!("[gate] kill pid={pid} uid={uid} (timeout)"));
+                            if let Ok(mut c) = counters.lock() {
+                                *c.entry(uid).or_insert(0) += 1;
+                            }
+                            pending.swap_remove(i);
+                        }
+                        Some(_) => {
+                            i += 1;
+                        }
+                    }
                 }
             }
         });
@@ -108,9 +169,9 @@ impl Gate {
                     break; // wake pipe: shutdown
                 }
                 if (pfds[0].revents & libc::POLLIN) != 0 {
-                    // Drain immediately and queue each kill with its own ~10ms
-                    // deadline: system_server gets the attach reply in, and the
-                    // drain is never blocked by a sleep.
+                    // Drain immediately and queue each pid; the killer waits
+                    // for the oom_score_adj==0 trigger, so the drain itself
+                    // never sleeps and the ring buffer is never blocked.
                     while let Some(item) = events.next() {
                         if item.len() < 8 {
                             continue;
@@ -123,9 +184,7 @@ impl Gate {
                             }
                         }
                         log(&format!("[gate] blocked spawn pid={pid} uid={uid}"));
-                        let deadline = std::time::Instant::now()
-                            + std::time::Duration::from_millis(KILL_DELAY_MS);
-                        kill_tx.send((deadline, pid, uid)).ok();
+                        kill_tx.send((pid, uid)).ok();
                         recent.insert(pid, std::time::Instant::now());
                         if recent.len() > 64 {
                             recent.retain(|_, t| t.elapsed().as_secs() < 10);
