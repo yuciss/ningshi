@@ -113,6 +113,13 @@ fn run_daemon() -> anyhow::Result<()> {
     let gate = Gate::start(Arc::clone(&kill_count))?;
     let mut engine = Engine::new(gate, rules, kill_count)?;
 
+    // Apply the initial block map right away: the first poll in the loop below
+    // can wait up to 15s, and until the first tick the BPF block map is empty
+    // (blocked apps would launch freely after every daemon restart).
+    if let Err(e) = engine.tick() {
+        log(&format!("[engine] initial tick error: {e}"));
+    }
+
     let listener = socket::listen(&socket_path())?;
     let fd = listener.as_raw_fd();
     log(&format!("[ningshi] listening on {}", socket_path()));
