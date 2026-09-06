@@ -203,8 +203,8 @@ const I18N = {
     scope: '计时口径', scope_fg: '前台', scope_any: '运行（含后台）',
     group_name: '组名', delete_group: '删除组', shared_pool: '共用计时池（时长）', shared_pool_hint: '切换后已计时长保留，冷却期重置',
     select_members: '选择应用', member_hint: '其他组中的应用不可选',
-    language: '模块语言', lang_auto: '跟随系统',
-    timezone: '时区', tz_auto: '跟随系统',
+    language: '模块语言',
+    timezone: '时区',
     status: 'daemon 状态', log: 'daemon 日志',
     refresh_log: '刷新日志', clear_log: '清空日志', log_cleared: '日志已清空',
     to: '至', remove: '删除', deleted: '已删除',
@@ -232,8 +232,8 @@ const I18N = {
     scope: 'Counting scope', scope_fg: 'Foreground', scope_any: 'Running (incl. background)',
     group_name: 'Group name', delete_group: 'Delete group', shared_pool: 'Shared pool (usage)', shared_pool_hint: 'Usage is kept; cooldown resets on toggle',
     select_members: 'Select apps', member_hint: 'Apps in other groups cannot be selected',
-    language: 'Language', lang_auto: 'Auto',
-    timezone: 'Timezone', tz_auto: 'Auto',
+    language: 'Language',
+    timezone: 'Timezone',
     status: 'Daemon status', log: 'Daemon log',
     refresh_log: 'Refresh log', clear_log: 'Clear log', log_cleared: 'Log cleared',
     to: 'to', remove: 'Remove', deleted: 'Deleted',
@@ -306,9 +306,8 @@ function detectModuleDir() {
 }
 
 function resolveLang() {
-  const s = (rules.settings && rules.settings.language) || 'auto';
-  if (s === 'zh' || s === 'en') lang = s;
-  else lang = (navigator.language || 'en').toLowerCase().startsWith('zh') ? 'zh' : 'en';
+  const s = (rules.settings && rules.settings.language) || 'en';
+  lang = (s === 'zh') ? 'zh' : 'en';
 }
 function t(key) { return (I18N[lang] && I18N[lang][key]) || key; }
 function tf(key, obj) { let s = t(key); for (const k in obj) s = s.replace('{' + k + '}', obj[k]); return s; }
@@ -996,12 +995,9 @@ async function groupSetScope(gid, val) {
 // ---------- module settings ----------
 function renderModuleSettings() {
   const s = rules.settings || {};
-  const langVal = s.language || 'auto';
-  const tzVal = s.timezone || 'auto';
-  const autoOffset = -new Date().getTimezoneOffset() / 60;
-  const autoOffsetLabel = 'UTC' + (autoOffset > 0 ? '+' + autoOffset : autoOffset);
-  const autoLangName = (navigator.language || 'en').toLowerCase().startsWith('zh') ? '中文' : 'English';
-  let tzOpts = `<option value="auto">${esc(t('tz_auto'))} (${autoOffsetLabel})</option>`;
+  const langVal = s.language || 'en';
+  const tzVal = s.timezone || 'UTC';
+  let tzOpts = '';
   for (let n = -12; n <= 14; n++) {
     const v = (n === 0) ? 'UTC' : 'UTC' + (n > 0 ? '+' : '') + n;
     const label = (n === 0) ? 'UTC' : 'UTC' + (n > 0 ? '+' + n : n);
@@ -1011,7 +1007,6 @@ function renderModuleSettings() {
     <div class="card">
       <div class="set-row"><div class="label">${esc(t('language'))}</div>
         <select onchange="setSetting('language', this.value)">
-          <option value="auto"${langVal === 'auto' ? ' selected' : ''}>${esc(t('lang_auto'))} (${autoLangName})</option>
           <option value="zh"${langVal === 'zh' ? ' selected' : ''}>中文</option>
           <option value="en"${langVal === 'en' ? ' selected' : ''}>English</option>
         </select></div>

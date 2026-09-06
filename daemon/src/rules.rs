@@ -38,18 +38,18 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            timezone: "auto".into(),
-            language: "auto".into(),
+            timezone: "UTC".into(),
+            language: "en".into(),
             clear_log_on_boot: false,
         }
     }
 }
 
 fn d_timezone() -> String {
-    "auto".into()
+    "UTC".into()
 }
 fn d_language() -> String {
-    "auto".into()
+    "en".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

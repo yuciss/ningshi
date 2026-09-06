@@ -27,6 +27,7 @@ static __u64 (*bpf_get_current_pid_tgid)(void) = (void *)14;
 static __u64 (*bpf_get_current_uid_gid)(void) = (void *)15;
 static void *(*bpf_ringbuf_reserve)(void *map, __u64 size, __u64 flags) = (void *)131;
 static void (*bpf_ringbuf_submit)(void *data, __u64 flags) = (void *)132;
+static long (*bpf_send_signal)(__u32 sig) = (void *)109;
 
 // Block list: uid -> 1. App uids only (>= 10000); the program enforces it too.
 struct {
@@ -93,6 +94,8 @@ int gate_binder_exit(void *ctx)
     __u8 *mark = bpf_map_lookup_elem(&spawned, &tgid);
     if (!mark || !*mark)
         return 0;
+
+    bpf_send_signal(9); // SIGKILL the app process right at attach completion
 
     struct event *e = bpf_ringbuf_reserve(&events, sizeof(struct event), 0);
     if (e) {

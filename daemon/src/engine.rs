@@ -2,7 +2,6 @@
 // Priority: extension > always_on > lock_block (screen off) > cooldown > duration over > time windows.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -85,10 +84,6 @@ pub struct Engine {
     last_save: u64,
     /// last blocked-uid sweep epoch seconds
     last_sweep: u64,
-    /// cached device-local offset for tz "auto" (seconds east)
-    auto_offset: AtomicI32,
-    /// epoch when auto_offset was last refreshed
-    auto_offset_at: AtomicU64,
 }
 
 impl Engine {
@@ -118,8 +113,6 @@ impl Engine {
             tz_secs: None,
             last_save: 0,
             last_sweep: 0,
-            auto_offset: AtomicI32::new(0),
-            auto_offset_at: AtomicU64::new(0),
         };
         eng.reload()?;
         eng.load_state();
@@ -544,35 +537,14 @@ impl Engine {
     }
 
     /// Current epoch seconds, minute of day and date in the configured timezone.
-    /// The daemon is a static musl binary without Android's TZ handling, so
-    /// "auto" resolves the device offset via `date +%z` (cached 60s) instead
-    /// of chrono::Local, which would silently stay on UTC.
     fn now_parts(&self) -> (u64, u32, NaiveDate) {
         let utc = chrono::Utc::now();
         let epoch = utc.timestamp() as u64;
-        let secs = match self.tz_secs {
-            Some(s) => s,
-            None => self.resolve_auto_offset(epoch),
-        };
+        let secs = self.tz_secs.unwrap_or(0);
         let off = chrono::FixedOffset::east_opt(secs)
             .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).unwrap());
         let dt = utc.with_timezone(&off);
         (epoch, dt.hour() * 60 + dt.minute(), dt.date_naive())
-    }
-
-    /// Device-local UTC offset in seconds, refreshed at most once per minute.
-    fn resolve_auto_offset(&self, now: u64) -> i32 {
-        let cached_at = self.auto_offset_at.load(Ordering::Relaxed);
-        if cached_at != 0 && now.saturating_sub(cached_at) < 60 {
-            return self.auto_offset.load(Ordering::Relaxed);
-        }
-        let off = match std::process::Command::new("date").arg("+%z").output() {
-            Ok(o) => parse_tz_offset(String::from_utf8_lossy(&o.stdout).trim()),
-            Err(_) => 0,
-        };
-        self.auto_offset.store(off, Ordering::Relaxed);
-        self.auto_offset_at.store(now, Ordering::Relaxed);
-        off
     }
 
     /// Status snapshot for the WebUI.
@@ -726,20 +698,4 @@ fn parse_tz(value: &str) -> Option<i32> {
     }
     let n: i32 = v.strip_prefix("UTC")?.parse().ok()?;
     Some(n * 3600)
-}
-
-/// Parse `date +%z` output like "+0800" into seconds east of UTC.
-fn parse_tz_offset(s: &str) -> i32 {
-    let b = s.trim().as_bytes();
-    if b.len() != 5 || (b[0] != b'+' && b[0] != b'-') {
-        return 0;
-    }
-    let hh = (b[1] as i32 - b'0' as i32) * 10 + (b[2] as i32 - b'0' as i32);
-    let mm = (b[3] as i32 - b'0' as i32) * 10 + (b[4] as i32 - b'0' as i32);
-    let secs = hh * 3600 + mm * 60;
-    if b[0] == b'-' {
-        -secs
-    } else {
-        secs
-    }
 }

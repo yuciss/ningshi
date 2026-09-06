@@ -2,14 +2,14 @@
 // - kprobe on binder_transaction entry: current uid is blocked AND target
 //   handle != 0 (the first handle != 0 transaction of a new process is
 //   attachApplication) -> mark the tgid pending.
-// - kretprobe on binder_transaction exit: marked -> push ringbuf event,
-//   background thread sends SIGKILL.
-// Attach has completed at that point, so system_server gets the death
-// notification instantly: no black screen.
+// - kretprobe on binder_transaction exit: marked -> bpf_send_signal(SIGKILL)
+//   in the kernel (attach has completed, no black screen), plus a ringbuf
+//   event for statistics.
+// The userspace thread only counts kills; it no longer sends the signal.
 
 use std::collections::HashMap as StdHashMap;
 use std::convert::TryInto;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::{Arc, Mutex};
 
 use aya::maps::{HashMap, MapData, RingBuf};
@@ -23,7 +23,8 @@ pub struct Gate {
     _bpf: Ebpf,
     /// Block map: uid -> 1. The engine adds/removes uids through it.
     pub blocked: HashMap<MapData, u32, u8>,
-    stop: Arc<AtomicBool>,
+    /// Write end of the wake pipe: writing a byte unblocks the stats thread.
+    wake_fd: RawFd,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -58,15 +59,33 @@ impl Gate {
             .ok_or_else(|| anyhow::anyhow!("map 'events' not found"))?
             .try_into()?;
 
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop2 = Arc::clone(&stop);
+        // Wake pipe: drop writes a byte so the stats thread unblocks and exits.
+        let mut fds = [0i32; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            anyhow::bail!("pipe failed");
+        }
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        let ring_fd = events.as_raw_fd();
+
         let counters = Arc::clone(&kill_count);
         let handle = std::thread::spawn(move || {
-            // One spawn can emit several events while dying; kill and count it once.
+            // The signal is now sent in the kernel; this thread only counts.
+            // One spawn may emit several events while dying, so count once.
             let mut recent: StdHashMap<u32, std::time::Instant> = StdHashMap::new();
-            while !stop2.load(Ordering::Relaxed) {
-                match events.next() {
-                    Some(item) => {
+            let mut pfds = [
+                libc::pollfd { fd: ring_fd, events: libc::POLLIN, revents: 0 },
+                libc::pollfd { fd: read_fd, events: libc::POLLIN, revents: 0 },
+            ];
+            loop {
+                let r = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+                if r <= 0 {
+                    continue; // EINTR or error, retry
+                }
+                if (pfds[1].revents & libc::POLLIN) != 0 {
+                    break; // wake pipe: shutdown
+                }
+                if (pfds[0].revents & libc::POLLIN) != 0 {
+                    while let Some(item) = events.next() {
                         if item.len() < 8 {
                             continue;
                         }
@@ -77,10 +96,7 @@ impl Gate {
                                 continue;
                             }
                         }
-                        log(&format!("[gate] block spawn pid={pid} uid={uid}"));
-                        // Attach already completed (event fires at the kretprobe),
-                        // so killing now lets system_server clean up instantly.
-                        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                        log(&format!("[gate] blocked spawn pid={pid} uid={uid}"));
                         if let Ok(mut c) = counters.lock() {
                             *c.entry(uid).or_insert(0) += 1;
                         }
@@ -89,15 +105,15 @@ impl Gate {
                             recent.retain(|_, t| t.elapsed().as_secs() < 10);
                         }
                     }
-                    None => std::thread::sleep(std::time::Duration::from_millis(20)),
                 }
             }
+            unsafe { libc::close(read_fd) };
         });
 
         Ok(Self {
             _bpf: bpf,
             blocked,
-            stop,
+            wake_fd: write_fd,
             handle: Some(handle),
         })
     }
@@ -114,9 +130,12 @@ impl Gate {
 
 impl Drop for Gate {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        // Wake the stats thread so it exits, then join.
+        let one = [1u8; 1];
+        unsafe { libc::write(self.wake_fd, one.as_ptr() as *const _, 1) };
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+        unsafe { libc::close(self.wake_fd) };
     }
 }
