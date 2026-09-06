@@ -1,10 +1,12 @@
-// Gate: deterministic detect-then-kill, no delay hacks.
+// Gate: deterministic detect-then-kill.
 // - kprobe on binder_transaction entry: current uid is blocked AND target
 //   handle != 0 (the first handle != 0 transaction of a new process is
 //   attachApplication) -> mark the tgid pending.
 // - kretprobe on binder_transaction exit: marked -> push ringbuf event.
-// - The userspace thread sends SIGKILL from outside the binder driver, so
-//   system_server gets the death notification promptly: no black screen.
+// - A gate thread drains the ring buffer and hands each kill to a small worker
+//   pool. Every kill gets its own ~10ms deadline so system_server can finish the
+//   attach reply before the death notification (no black screen), and concurrent
+//   launches are killed in parallel without ever blocking the drain.
 
 use std::collections::HashMap as StdHashMap;
 use std::convert::TryInto;
@@ -67,15 +69,43 @@ impl Gate {
         let ring_fd = events.as_raw_fd();
 
         let counters = Arc::clone(&kill_count);
+
+        // Kill worker pool: killing is independent of the drain loop and runs in
+        // parallel. Each job carries its own deadline, so a burst of launches is
+        // handled concurrently and the ring buffer drain is never blocked.
+        const KILL_WORKERS: usize = 4;
+        const KILL_DELAY_MS: u64 = 10;
+        let mut senders: Vec<std::sync::mpsc::Sender<(std::time::Instant, u32, u32)>> = Vec::new();
+        let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        for _ in 0..KILL_WORKERS {
+            let (tx, rx) = std::sync::mpsc::channel::<(std::time::Instant, u32, u32)>();
+            senders.push(tx);
+            let counters = Arc::clone(&counters);
+            workers.push(std::thread::spawn(move || {
+                // Sleep until the deadline (system_server has time to finish the
+                // attach), then kill from userspace: no black screen. Exits once
+                // the gate thread drops all senders on shutdown.
+                while let Ok((deadline, pid, uid)) = rx.recv() {
+                    let now = std::time::Instant::now();
+                    if deadline > now {
+                        std::thread::sleep(deadline.duration_since(now));
+                    }
+                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                    if let Ok(mut c) = counters.lock() {
+                        *c.entry(uid).or_insert(0) += 1;
+                    }
+                }
+            }));
+        }
+
         let handle = std::thread::spawn(move || {
-            // Kill from userspace (outside the binder driver) so the death
-            // notification reaches system_server promptly: no black screen.
             // One spawn may emit several events while dying; kill and count once.
             let mut recent: StdHashMap<u32, std::time::Instant> = StdHashMap::new();
             let mut pfds = [
                 libc::pollfd { fd: ring_fd, events: libc::POLLIN, revents: 0 },
                 libc::pollfd { fd: read_fd, events: libc::POLLIN, revents: 0 },
             ];
+            let mut next = 0usize;
             loop {
                 let r = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
                 if r <= 0 {
@@ -85,9 +115,9 @@ impl Gate {
                     break; // wake pipe: shutdown
                 }
                 if (pfds[0].revents & libc::POLLIN) != 0 {
-                    // Give system_server ~10ms to process the attach reply before
-                    // the death notification, so the window closes instantly.
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    // Drain immediately and hand each kill to a worker with its
+                    // own ~10ms deadline: system_server gets the attach reply in,
+                    // and concurrent launches never block one another.
                     while let Some(item) = events.next() {
                         if item.len() < 8 {
                             continue;
@@ -100,16 +130,21 @@ impl Gate {
                             }
                         }
                         log(&format!("[gate] blocked spawn pid={pid} uid={uid}"));
-                        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-                        if let Ok(mut c) = counters.lock() {
-                            *c.entry(uid).or_insert(0) += 1;
-                        }
+                        let deadline = std::time::Instant::now()
+                            + std::time::Duration::from_millis(KILL_DELAY_MS);
+                        senders[next % KILL_WORKERS].send((deadline, pid, uid)).ok();
+                        next += 1;
                         recent.insert(pid, std::time::Instant::now());
                         if recent.len() > 64 {
                             recent.retain(|_, t| t.elapsed().as_secs() < 10);
                         }
                     }
                 }
+            }
+            // Drop senders so workers observe the disconnect and exit, then join.
+            drop(senders);
+            for w in workers {
+                let _ = w.join();
             }
             unsafe { libc::close(read_fd) };
         });
