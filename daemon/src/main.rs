@@ -125,7 +125,7 @@ fn run_daemon() -> anyhow::Result<()> {
             libc::pollfd { fd: ino_fd, events: libc::POLLIN, revents: 0 },
         ];
         let nfds: libc::nfds_t = if ino_fd >= 0 { 2 } else { 1 };
-        let r = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, 5000) };
+        let r = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, 15000) };
         if r > 0 {
             if (pfds[0].revents & libc::POLLIN) != 0 {
                 if let Ok((stream, _)) = listener.accept() {

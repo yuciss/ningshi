@@ -1,12 +1,12 @@
 // gate.bpf.c - Ningshi gate.
 // Deterministic kill, no delay hack:
 //   kprobe  binder_transaction entry: current uid is blocked AND target
-//           handle != 0 -> mark tgid. handle == 0 is a ServiceManager
-//           lookup (getService), skipped; the first handle != 0 transaction
-//           of a new process is attachApplication (app -> AMS).
-//   kretprobe binder_transaction exit: marked -> push ringbuf event.
-//           Attach has completed, so system_server gets the death
-//           notification instantly: window removed, no black screen.
+//           handle != 0 -> increment a per-tgid counter. handle == 0 is a
+//           ServiceManager lookup (getService), skipped. The first handle != 0
+//           transaction of a new process is attachApplication (app -> AMS).
+//   kretprobe binder_transaction exit: count >= 2 -> bpf_send_signal(SIGKILL)
+//           in the kernel. Killing on the SECOND call lets the attach reply
+//           reach system_server first, so the window closes with no black screen.
 
 typedef unsigned char __u8;
 typedef unsigned int __u32;
@@ -37,12 +37,13 @@ struct {
     __type(value, __u8);
 } blocked_uids SEC(".maps");
 
-// Pending kills: tgid -> 1 (marked at entry, killed at exit).
+// Pending kills: tgid -> count of handle!=0 transactions seen.
+// 1 = attach done (reply delivered); 2 = the next call, kill now.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1024);
     __type(key, __u32);
-    __type(value, __u8);
+    __type(value, __u32);
 } spawned SEC(".maps");
 
 // Event ring buffer.
@@ -82,8 +83,9 @@ int gate_binder_entry(struct pt_regs *ctx)
         return 0; // ServiceManager getService, keep waiting for attach
 
     __u32 tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
-    __u8 one = 1;
-    bpf_map_update_elem(&spawned, &tgid, &one, 0);
+    __u32 *cnt = bpf_map_lookup_elem(&spawned, &tgid);
+    __u32 next = cnt ? (*cnt + 1) : 1;
+    bpf_map_update_elem(&spawned, &tgid, &next, 0);
     return 0;
 }
 
@@ -91,11 +93,11 @@ SEC("kretprobe/binder_transaction")
 int gate_binder_exit(void *ctx)
 {
     __u32 tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
-    __u8 *mark = bpf_map_lookup_elem(&spawned, &tgid);
-    if (!mark || !*mark)
-        return 0;
+    __u32 *cnt = bpf_map_lookup_elem(&spawned, &tgid);
+    if (!cnt || *cnt < 2)
+        return 0; // first (attach) transaction just finished; reply is delivered
 
-    bpf_send_signal(9); // SIGKILL the app process right at attach completion
+    bpf_send_signal(9); // SIGKILL the app process
 
     struct event *e = bpf_ringbuf_reserve(&events, sizeof(struct event), 0);
     if (e) {

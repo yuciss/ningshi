@@ -63,7 +63,13 @@ pub fn handle(mut stream: UnixStream, engine: &mut Engine) {
             Ok(()) => ok_resp(serde_json::json!({})),
             Err(e) => err_resp(&e.to_string()),
         },
-        "status" => ok_resp(engine.status()),
+        "status" => {
+            // Refresh on demand so the WebUI always gets up-to-date state.
+            if let Err(e) = engine.tick() {
+                log(&format!("[socket] tick error: {e}"));
+            }
+            ok_resp(engine.status())
+        }
         "extension" => {
             let key = req.key.unwrap_or_default();
             let minutes = req.minutes.unwrap_or(5);
