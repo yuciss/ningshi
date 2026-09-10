@@ -2,14 +2,14 @@
 
 # Ningshi
 
-**Version 0.3.9**
+**Version 0.4.2**
 
 Ningshi (凝时) is a KernelSU module. It helps you scroll less and keeps apps from running in the background.
 
 ## Features
 
 - **Kill at launch.** App code is stopped before it runs.
-- **Rules.** Always-on, lock-screen block, time windows, duration limit + cooldown; per-app and shared-pool groups.
+- **Rules.** Always-on, lock-screen block, time windows (per weekday), duration limit + cooldown; per-app and shared-pool groups.
 - **WebUI.** Configure everything in the browser.
 
 ## Usage
@@ -18,7 +18,7 @@ Each app (or group) can combine four rules:
 
 - **Always on** — block it all the time.
 - **Lock screen** — block while the screen is off.
-- **Time windows** — block within chosen hours (or allow only within them).
+- **Time windows** — pick the hours and the weekdays. A window means "usable only inside it" by default; switch the policy to *Block in windows* to invert it. No weekday selected = every day. A window that crosses midnight belongs to the day it starts on (Monday 22:00-07:00 covers Monday night into Tuesday morning).
 - **Duration** — allow a limited usage time; once used up, it resets the next day, or blocks for a **cooldown** period and then resets automatically.
 
 The **+5 / +20** buttons grant a temporary **extension** (capped daily) for when you really need the app.
@@ -80,8 +80,9 @@ adb shell su -c 'pkill -9 ningshi; sleep 1; cp /data/local/tmp/ningshi /data/adb
 CLI:
 
 ```bash
-ningshi status                       # status JSON (blocked uids / usage / kill counts)
+ningshi status                       # status JSON (blocked uids / usage / kill counts / gate health)
 ningshi reload                       # reload rules.json
+ningshi apply <file>                 # validate a rules file, then make it live
 ningshi extension <key> <minutes>    # grant a temporary extension
 ningshi version
 ningshi clear_log
@@ -91,8 +92,13 @@ ningshi clear_log
 
 `/data/adb/ningshi/rules.json` is the single data contract shared by the WebUI and the daemon; see `daemon/rules.example.json`. Unknown fields are ignored when parsing, for forward compatibility.
 
+Writes go through `ningshi apply`: the daemon parses the candidate file first and only then replaces the live one, so a bad write can never disarm the module. The last file that parsed cleanly is kept as `rules.json.ok` and is used (loudly, in the log) if the live file becomes unreadable. A file claiming a newer schema version than the daemon supports is refused instead of being misread.
+
 ### Key design
 
-- **Interception**: the kprobe checks the uid at `binder_transaction` entry; the first non-zero-handle transaction (`attachApplication`) marks the tgid, and the kretprobe emits an event. The userspace killer waits for the process to become the foreground app (`oom_score_adj == 0`, i.e. the attach handshake is complete) and then sends `SIGKILL` through a pidfd, so a recycled pid can never redirect the kill.
-- **Detection**: foreground / screen state / package-to-uid are read from kernel filesystems (cpuset / DRM / `packages.list`).
+- **Interception**: two independent kernel anchors, either of which is enough. A kprobe on `binder_transaction` checks the uid at entry; the first non-zero-handle transaction (`attachApplication`) marks the tgid and the kretprobe reports it. A kretprobe on `__arm64_sys_setresuid` reports a process that just swapped to a blocked uid - which also catches spawns that never talk to binder, and works on kernels where `binder_transaction` is missing or inlined. The userspace killer waits for the process to become foreground (`oom_score_adj == 0`, i.e. the attach handshake is complete) and only then sends `SIGKILL` through a pidfd, so a recycled pid can never redirect the kill; it also re-checks the block list first, because a kernel-side mark can outlive the rule that created it.
+- **Detection**: foreground / screen state / package-to-uid are read from kernel filesystems (cpuset / DRM / `packages.list`); a pid's uid comes from `/proc/<pid>` ownership - one stat instead of parsing the status file of every process (verified identical on the test device).
+- **Adaptive scheduling**: the daemon sleeps until the next moment something can actually change: the next window edge, the next extension/cooldown expiry, local midnight, or the 60s sweep interval while any app is blocked. With nothing time-dependent configured it idles for ~5 minutes, and `/data/system` events other than `packages.list` are ignored. Blocking a launch happens in the kernel, so a long sleep never weakens enforcement.
+- **Single instance**: the daemon holds an `flock` and exits when another instance owns it; two instances would attach two sets of probes with two conflicting block maps.
 - **Fail-open**: every failed detection lets the app through. A periodic sweep covers any process the gate missed.
+- **Health**: `status.gate` reports which anchors are attached plus the kernel-side counters (marks, events, ring-buffer drops, skipped kills), and `rules_source` says whether the running rules came from the file, the fallback copy or the built-in default.

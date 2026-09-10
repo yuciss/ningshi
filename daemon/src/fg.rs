@@ -35,26 +35,30 @@ pub fn top_app_pids() -> HashSet<i32> {
 
 /// Resolve the real uid of a single pid (None if it exited).
 fn pid_uid(pid: i32) -> Option<u32> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    status
-        .lines()
-        .find(|l| l.starts_with("Uid:"))
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse::<u32>().ok())
+    crate::proc::pid_uid(pid)
 }
 
 /// Foreground uids for the given top-app pids, and (when need_live is set)
-/// live uids from one full /proc pass. When every duration rule counts
-/// "foreground" only, need_live is false and we read just the few top-app
+/// live uids from one pass over /proc. When every duration rule counts
+/// "foreground" only, need_live is false and we look at just the few top-app
 /// pids instead of walking all of /proc every tick.
-pub fn uids_snapshot(top_pids: &HashSet<i32>, need_live: bool) -> (HashSet<u32>, HashSet<u32>) {
+///
+/// `targets` are the only uids anyone is accounting for: results are filtered
+/// to them, so the walk never grows map entries for the other ~300 packages.
+pub fn uids_snapshot(
+    top_pids: &HashSet<i32>,
+    need_live: bool,
+    targets: &HashSet<u32>,
+) -> (HashSet<u32>, HashSet<u32>) {
     let mut live = HashSet::new();
     let mut fg = HashSet::new();
 
     if !need_live {
         for &pid in top_pids {
             if let Some(uid) = pid_uid(pid) {
-                fg.insert(uid);
+                if targets.contains(&uid) {
+                    fg.insert(uid);
+                }
             }
         }
         return (live, fg);
@@ -70,11 +74,13 @@ pub fn uids_snapshot(top_pids: &HashSet<i32>, need_live: bool) -> (HashSet<u32>,
         if pid <= 1 {
             continue;
         }
-        if let Some(uid) = pid_uid(pid) {
-            live.insert(uid);
-            if top_pids.contains(&pid) {
-                fg.insert(uid);
-            }
+        let Some(uid) = pid_uid(pid) else { continue };
+        if !targets.contains(&uid) {
+            continue;
+        }
+        live.insert(uid);
+        if top_pids.contains(&pid) {
+            fg.insert(uid);
         }
     }
     (live, fg)

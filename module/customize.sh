@@ -2,8 +2,24 @@
 
 [ "$(uname -m)" = "aarch64" ] || abort "Ningshi supports arm64 only, current: $(uname -m)"
 
-grep -qE "[[:space:]]binder_transaction$" /proc/kallsyms 2>/dev/null \
-  || abort "kernel lacks the binder_transaction symbol, interception unavailable"
+# The gate has two independent kernel anchors and needs at least one of them:
+#   * binder_transaction    - precise: the first non-zero-handle transaction of a
+#                             new process is attachApplication;
+#   * __arm64_sys_setresuid - independent of binder: a process just swapped to a
+#                             blocked uid (zygote's child does this before any
+#                             app code runs).
+# Having both is best, so a missing symbol degrades instead of refusing to
+# install; a clear message beats a module that silently does nothing.
+anchor_binder=0
+anchor_uid=0
+
+grep -qE "[[:space:]]binder_transaction$" /proc/kallsyms 2>/dev/null && anchor_binder=1
+grep -qE "[[:space:]]__arm64_sys_setresuid$" /proc/kallsyms 2>/dev/null && anchor_uid=1
+
+if [ "$anchor_binder" = 0 ] && [ "$anchor_uid" = 0 ]; then
+  abort "kernel exposes neither binder_transaction nor __arm64_sys_setresuid, interception unavailable"
+fi
+ui_print "- gate anchors: binder_transaction=$anchor_binder uid_switch=$anchor_uid"
 
 mkdir -p /data/adb/ningshi
 set_perm /data/adb/ningshi 0 0 0700

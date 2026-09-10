@@ -2,14 +2,14 @@
 
 # 凝时
 
-**版本 0.3.9**
+**版本 0.4.2**
 
 凝时（Ningshi）是一个 KernelSU 模块。它可以帮你少刷手机，或者防止应用偷跑。
 
 ## 特色
 
 - **启动即拦截。** 应用代码执行前就被停止。
-- **规则设定。** 总是开启、锁屏封禁、时间段、时长上限 + 冷却期；支持单应用与共用计时池分组。
+- **规则设定。** 总是开启、锁屏封禁、时间段（可按星期）、时长上限 + 冷却期；支持单应用与共用计时池分组。
 - **WebUI 配置。** 在网页内完成全部配置。
 
 ## 用法
@@ -18,7 +18,7 @@
 
 - **总是开启** —— 一直封禁。
 - **锁屏封禁** —— 屏幕关闭时封禁。
-- **时间段** —— 在选定时段内封禁（或仅允许在时段内使用）。
+- **时间段** —— 选择时段与星期。时间段默认的含义是「仅窗内可用」，想要反过来（窗内禁止）就把策略切到*窗内禁止*。不选任何星期 = 每天。跨午夜的时间段归属于它开始的那一天（周一 22:00-07:00 覆盖周一夜里到周二早上）。
 - **时长** —— 限制使用时长；用完后第二天重置，或进入**冷却期**封禁，冷却结束后自动重置。
 
 **+5 / +20** 按钮是临时**延时**（每日封顶），真要用的时候可以临时放行。
@@ -76,8 +76,9 @@ adb shell su -c 'pkill -9 ningshi; sleep 1; cp /data/local/tmp/ningshi /data/adb
 daemon 自带 CLI：
 
 ```bash
-ningshi status                       # 状态 JSON（封禁 uid / 用量 / 拦截计数）
+ningshi status                       # 状态 JSON（封禁 uid / 用量 / 拦截计数 / 门钩健康）
 ningshi reload                       # 重载 rules.json
+ningshi apply <文件>                 # 校验规则文件后再替换线上配置
 ningshi extension <key> <minutes>    # 临时延时
 ningshi version
 ningshi clear_log
@@ -87,8 +88,13 @@ ningshi clear_log
 
 `/data/adb/ningshi/rules.json` 是 WebUI 与 daemon 共用的唯一数据契约，字段见 `daemon/rules.example.json`；解析时未知字段会被忽略，便于向前兼容。
 
+写入一律走 `ningshi apply`：daemon 先解析候选文件、确认没问题才替换线上文件，所以一次错误写入不可能让模块失去防护。最后一次解析成功的副本保留在 `rules.json.ok`，当线上文件读不出来时会回退到它（并在日志里明说）。声明了更高 schema 版本的文件会被拒绝，而不是按旧字段误读。
+
 ### 关键设计
 
-- **拦截**：kprobe 在 `binder_transaction` 入口按 uid 判黑，第一个 handle≠0 的事务（`attachApplication`）标记 tgid，kretprobe 发出事件；用户态 killer 等到进程成为前台（`oom_score_adj == 0`，即 attach 握手完成）后，经 pidfd 发送 `SIGKILL`——被回收的 pid 无法再让击杀落错目标。
-- **检测**：前台 / 屏状态 / 包名→uid 全部读内核文件系统（cpuset / DRM / `packages.list`）。
+- **拦截**：两个互相独立的内核锚点，任意一个可用即可工作。kprobe 挂在 `binder_transaction` 入口按 uid 判黑，第一个 handle≠0 的事务（`attachApplication`）标记 tgid，kretprobe 发出事件；另一个 kretprobe 挂在 `__arm64_sys_setresuid`，进程刚切到被封禁的 uid 就上报——这条链路不依赖 binder 内部实现，也能覆盖从不与 binder 说话、以及内核里 `binder_transaction` 缺失或被内联的情况。用户态 killer 等到进程成为前台（`oom_score_adj == 0`，即 attach 握手完成）后，经 pidfd 发送 `SIGKILL`——被回收的 pid 无法让击杀落错目标；发送前还会再核对一次封禁名单，因为内核侧的标记可能比规则活得更久。
+- **检测**：前台 / 屏状态 / 包名→uid 全部读内核文件系统（cpuset / DRM / `packages.list`）；pid 的 uid 直接取 `/proc/<pid>` 的属主（一次 stat，而不是解析每个进程的 status 文件；已在设备上逐进程核对一致）。
+- **自适应调度**：daemon 只睡到"下一个可能发生变化"的时刻——下一个时间窗边界、延时/冷却到期、本地零点，或在有封禁项时的 60 秒清扫周期。没有任何时间相关规则时进入约 5 分钟的静默睡眠，而且 `/data/system` 里除 `packages.list` 之外的事件一律忽略。启动拦截发生在内核里，所以睡久一点不会削弱拦截。
+- **单实例**：daemon 持有 flock，发现已有实例在跑就直接退出；两个实例会挂上两套钩子、两张互相覆盖的封禁表。
 - **失败方向**：所有检测失败时一律放行。周期性清扫兜底门钩漏掉的残留进程。
+- **健康可见**：`status.gate` 报告哪些锚点挂上了，以及内核侧计数（标记数、事件数、ringbuf 丢弃、跳过的击杀）；`rules_source` 说明当前规则来自线上文件、回退副本还是内置默认值。
