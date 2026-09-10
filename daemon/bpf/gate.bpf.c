@@ -48,6 +48,7 @@ static __u64 (*bpf_get_current_pid_tgid)(void) = (void *)14;
 static __u64 (*bpf_get_current_uid_gid)(void) = (void *)15;
 static void *(*bpf_ringbuf_reserve)(void *map, __u64 size, __u64 flags) = (void *)131;
 static void (*bpf_ringbuf_submit)(void *data, __u64 flags) = (void *)132;
+static __u64 (*bpf_ktime_get_ns)(void) = (void *)5;
 
 // Block list: uid -> 1. App uids only (>= 10000); the program enforces it too.
 struct {
@@ -71,6 +72,14 @@ struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 64 * 1024);
 } events SEC(".maps");
+
+// tgid -> last report time (ns): see recently_reported().
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32);
+    __type(value, __u64);
+} reported SEC(".maps");
 
 // Health counters, readable from userspace. Per-CPU so no atomic instruction is
 // needed (BPF atomics are only available on newer kernels); the daemon sums the
@@ -124,6 +133,23 @@ static __always_inline void emit(__u32 pid, __u32 uid, __u32 drop_idx)
     bpf_ringbuf_submit(e, 0);
 }
 
+// A process that is already being handled keeps talking: a blocked app in its
+// last milliseconds, or a process the userspace side deliberately refuses to kill,
+// issues transactions far faster than anyone needs to hear about them (measured:
+// ~800/s). Report each tgid at most once per cooldown; a relaunch is a new tgid,
+// so nothing is lost.
+#define REPORT_COOLDOWN_NS (5ULL * 1000000000ULL)
+
+static __always_inline int recently_reported(__u32 tgid)
+{
+    __u64 *last = bpf_map_lookup_elem(&reported, &tgid);
+    __u64 now = bpf_ktime_get_ns();
+    if (last && now - *last < REPORT_COOLDOWN_NS)
+        return 1;
+    bpf_map_update_elem(&reported, &tgid, &now, 0);
+    return 0;
+}
+
 SEC("kprobe/binder_transaction")
 int gate_binder_entry(struct pt_regs *ctx)
 {
@@ -145,6 +171,9 @@ int gate_binder_entry(struct pt_regs *ctx)
         return 0; // ServiceManager getService, keep waiting for attach
 
     __u32 tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+    if (recently_reported(tgid))
+        return 0;
+
     __u8 one = 1;
     bpf_map_update_elem(&spawned, &tgid, &one, 0);
     bump(0);

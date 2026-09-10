@@ -437,29 +437,44 @@ fn kill_if_blocked(
         log(&format!("[gate] skip pid={pid} uid={uid} (no longer blocked)"));
         return false;
     }
-    if !identity_ok(identity, pid, uid) {
+    let (matches, seen) = identity_ok(identity, pid, uid);
+    if !matches {
         identity_skipped.fetch_add(1, Ordering::Relaxed);
         proc::close(pidfd);
-        log(&format!("[gate] skip pid={pid} uid={uid} (different app for this uid)"));
+        log(&format!("[gate] skip pid={pid} uid={uid} (identity: {seen})"));
         return false;
     }
     proc::pidfd_kill(pidfd);
     true
 }
 
+/// How long to keep re-reading a process's identity before refusing a kill.
+/// Android sets the app process name a moment after the credential switch, so a
+/// probe that fires at the switch can still see the inherited name.
+const IDENTITY_TRIES: u32 = 20;
+const IDENTITY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// Is this pid one of the packages the user blocked for this uid?
-fn identity_ok(identity: &IdentityIndex, pid: u32, uid: u32) -> bool {
+/// Returns the verdict plus the identity that was seen, for the skip log.
+fn identity_ok(identity: &IdentityIndex, pid: u32, uid: u32) -> (bool, String) {
     let names = match identity.lock() {
         Ok(index) => index.get(&uid).cloned(),
         Err(_) => None,
     };
     let Some(names) = names else {
-        // No names recorded for the uid: nothing to confirm against.
-        return false;
+        return (false, "no blocked package for this uid".to_string());
     };
-    match proc::pkg_of_pid(pid) {
-        Some(pkg) => names.iter().any(|n| n == &pkg),
-        None => true,
+    if names.is_empty() {
+        return (false, "empty block list".to_string());
+    }
+    match proc::pkg_of_pid_wait(pid, &names, IDENTITY_TRIES, IDENTITY_DELAY) {
+        Some(pkg) => {
+            let ok = names.iter().any(|n| n == &pkg);
+            (ok, pkg)
+        }
+        // Identity unreadable (the process is on its way out): the uid verdict
+        // came from the kernel's own block map, so it stands.
+        None => (true, "unreadable".to_string()),
     }
 }
 

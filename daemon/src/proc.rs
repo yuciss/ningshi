@@ -106,6 +106,33 @@ pub fn pkg_of_pid(pid: u32) -> Option<String> {
     pkg_from_cmdline(&raw)
 }
 
+/// Package name of a running process, retried briefly.
+///
+/// Android rewrites an app process's argv[0] to its package name *after* the
+/// credential switch, so a probe that fires at the switch itself can still see
+/// the inherited name ("zygote"). Retry until one of the wanted names shows up,
+/// and return the last name seen either way so the caller can log what it saw.
+pub fn pkg_of_pid_wait(
+    pid: u32,
+    expected: &[String],
+    attempts: u32,
+    delay: std::time::Duration,
+) -> Option<String> {
+    let mut seen = None;
+    for i in 0..attempts.max(1) {
+        if let Some(pkg) = pkg_of_pid(pid) {
+            if expected.iter().any(|n| n == &pkg) {
+                return Some(pkg);
+            }
+            seen = Some(pkg);
+        }
+        if i + 1 < attempts {
+            std::thread::sleep(delay);
+        }
+    }
+    seen
+}
+
 #[cfg(test)]
 mod tests {
     use super::pkg_from_cmdline;
