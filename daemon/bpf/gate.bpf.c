@@ -174,8 +174,14 @@ int gate_binder_exit(void *ctx)
 }
 
 // Secondary anchor: a process that just switched to a blocked uid. Catches app
-// spawns independently of binder, right after zygote forked the child.
-SEC("kretprobe/__arm64_sys_setresuid")
+// spawns independently of binder, before any app code runs.
+//
+// The section name only tells the loader this is a kretprobe; the daemon attaches
+// it to the first symbol that works from a candidate list (commit_creds first -
+// every credential change in Linux goes through it, no matter which syscall or
+// namespace mechanism Android happens to use - then the generated
+// __arm64_sys_setresuid wrapper).
+SEC("kretprobe/commit_creds")
 int gate_uid_switch(void *ctx)
 {
     __u32 uid = (__u32)bpf_get_current_uid_gid();

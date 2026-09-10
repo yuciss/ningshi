@@ -2,7 +2,7 @@
 
 # Ningshi
 
-**Version 0.4.2**
+**Version 0.4.3**
 
 Ningshi (凝时) is a KernelSU module. It helps you scroll less and keeps apps from running in the background.
 
@@ -96,7 +96,8 @@ Writes go through `ningshi apply`: the daemon parses the candidate file first an
 
 ### Key design
 
-- **Interception**: two independent kernel anchors, either of which is enough. A kprobe on `binder_transaction` checks the uid at entry; the first non-zero-handle transaction (`attachApplication`) marks the tgid and the kretprobe reports it. A kretprobe on `__arm64_sys_setresuid` reports a process that just swapped to a blocked uid - which also catches spawns that never talk to binder, and works on kernels where `binder_transaction` is missing or inlined. The userspace killer waits for the process to become foreground (`oom_score_adj == 0`, i.e. the attach handshake is complete) and only then sends `SIGKILL` through a pidfd, so a recycled pid can never redirect the kill; it also re-checks the block list first, because a kernel-side mark can outlive the rule that created it.
+- **Interception**: two independent kernel anchors, either of which is enough, and which symbols they use is decided by probing what the running kernel actually has (visible as `status.gate.uid_switch_symbol`). A kretprobe on `commit_creds` reports a process that just switched to a blocked uid - every credential change in Linux goes through it, whichever syscall or namespace mechanism Android uses; it falls back to the generated `__arm64_sys_setresuid` wrapper. A kprobe/kretprobe pair on `binder_transaction` reports the first non-zero-handle transaction of a new process. The userspace killer waits for the process to become foreground (`oom_score_adj == 0`, i.e. the attach handshake is complete) and only then sends `SIGKILL` through a pidfd, so a recycled pid can never redirect the kill, and it re-checks the block list first because a kernel-side mark can outlive the rule that created it.
+- **Identity**: the kernel only answers "a process of a blocked uid appeared". Before signalling, the killer reads that process's own `/proc/<pid>/cmdline` and requires it to carry one of the package names the user blocked for that uid - a name the process itself was given, not something read out of a system file. `/data/system/packages.list` is therefore only a lookup table for uids, never the authority on who a process is, so a uid recycled by a newly installed app can never be hit (such skips are counted in `status.gate.identity_skipped`).
 - **Detection**: foreground / screen state / package-to-uid are read from kernel filesystems (cpuset / DRM / `packages.list`); a pid's uid comes from `/proc/<pid>` ownership - one stat instead of parsing the status file of every process (verified identical on the test device).
 - **Adaptive scheduling**: the daemon sleeps until the next moment something can actually change: the next window edge, the next extension/cooldown expiry, local midnight, or the 60s sweep interval while any app is blocked. With nothing time-dependent configured it idles for ~5 minutes, and `/data/system` events other than `packages.list` are ignored. Blocking a launch happens in the kernel, so a long sleep never weakens enforcement.
 - **Single instance**: the daemon holds an `flock` and exits when another instance owns it; two instances would attach two sets of probes with two conflicting block maps.

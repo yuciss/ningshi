@@ -47,6 +47,8 @@ pub struct GateHealth {
     pub binder_entry: bool,
     pub binder_exit: bool,
     pub uid_switch: bool,
+    /// the symbol the uid-switch anchor actually attached to
+    pub uid_switch_symbol: &'static str,
     /// blocked transactions marked at entry
     pub marks: u64,
     /// events emitted by the binder anchor
@@ -61,7 +63,15 @@ pub struct GateHealth {
     pub probe_read_failures: u64,
     /// queued kills dropped because the uid was no longer blocked
     pub kill_skipped: u64,
+    /// queued kills dropped because the process turned out to be a different app
+    /// (a recycled uid - exactly the case name confirmation exists for)
+    pub identity_skipped: u64,
 }
+
+/// uid -> package names currently blocked for it. The kernel only says "this
+/// process switched to a blocked uid"; the package name the process carries in
+/// its own cmdline decides whether it really is the app the user blocked.
+type IdentityIndex = Arc<Mutex<StdHashMap<u32, Vec<String>>>>;
 
 pub struct Gate {
     /// Holds the BPF object so kprobe links stay attached while the daemon lives.
@@ -74,13 +84,25 @@ pub struct Gate {
     /// must still be blocked when the kill is actually sent (a stale mark can
     /// otherwise redirect a kill onto a recycled pid).
     blocked_set: Arc<Mutex<StdHashMap<u32, u8>>>,
+    /// Blocked package names per uid, refreshed by the engine every tick.
+    identity: IdentityIndex,
     /// Attach state + counter for kills refused by the userspace re-check.
     attached: GateHealth,
     kill_skipped: Arc<AtomicU64>,
+    identity_skipped: Arc<AtomicU64>,
     /// Write end of the wake pipe: writing a byte unblocks the stats thread.
     wake_fd: RawFd,
     handle: Option<std::thread::JoinHandle<()>>,
 }
+
+/// Symbols to try for the "a process just switched to a blocked uid" anchor, most
+/// durable first:
+///   * commit_creds - core Linux, the single point every credential change goes
+///     through, whichever syscall or namespace mechanism Android uses;
+///   * __arm64_sys_setresuid - the generated syscall wrapper (what zygote's child
+///     calls today).
+/// The first one that attaches is used, and the choice is visible in status.gate.
+const UID_SWITCH_SYMBOLS: &[&str] = &["commit_creds", "__arm64_sys_setresuid"];
 
 /// Load and attach one program, tolerating a kernel that does not know the
 /// symbol: the caller decides whether enough anchors are left.
@@ -113,17 +135,23 @@ impl Gate {
             }
             Err(e) => log(&format!("[gate] binder exit anchor unavailable: {e}")),
         }
-        match attach_probe(&mut bpf, "gate_uid_switch", "__arm64_sys_setresuid") {
-            Ok(()) => {
-                attached.uid_switch = true;
-                log("[gate] kretprobe attached to __arm64_sys_setresuid");
+        // Capability probing: use the most durable symbol this kernel actually
+        // has, instead of hardcoding one name.
+        for symbol in UID_SWITCH_SYMBOLS {
+            match attach_probe(&mut bpf, "gate_uid_switch", symbol) {
+                Ok(()) => {
+                    attached.uid_switch = true;
+                    attached.uid_switch_symbol = symbol;
+                    log(&format!("[gate] kretprobe attached to {symbol} (uid switch)"));
+                    break;
+                }
+                Err(e) => log(&format!("[gate] uid-switch anchor '{symbol}' unavailable: {e}")),
             }
-            Err(e) => log(&format!("[gate] uid-switch anchor unavailable: {e}")),
         }
         if !attached.binder_entry && !attached.uid_switch {
             anyhow::bail!(
-                "no usable kernel anchor: neither binder_transaction nor \
-                 __arm64_sys_setresuid could be attached"
+                "no usable kernel anchor: neither the binder probe nor the \
+                 uid-switch probe could be attached"
             );
         }
 
@@ -154,6 +182,10 @@ impl Gate {
         let killer_blocked = Arc::clone(&blocked_set);
         let kill_skipped = Arc::new(AtomicU64::new(0));
         let killer_skipped = Arc::clone(&kill_skipped);
+        let identity: IdentityIndex = Arc::new(Mutex::new(StdHashMap::new()));
+        let killer_identity = Arc::clone(&identity);
+        let identity_skipped = Arc::new(AtomicU64::new(0));
+        let killer_identity_skipped = Arc::clone(&identity_skipped);
 
         // Single killer thread: pids are killed the moment their oom_score_adj
         // hits 0 (attach handshake done -> foreground), never on a fixed delay.
@@ -225,6 +257,8 @@ impl Gate {
                             if kill_if_blocked(
                                 &killer_blocked,
                                 &killer_skipped,
+                                &killer_identity,
+                                &killer_identity_skipped,
                                 pidfd,
                                 pid,
                                 uid,
@@ -248,6 +282,8 @@ impl Gate {
                             if kill_if_blocked(
                                 &killer_blocked,
                                 &killer_skipped,
+                                &killer_identity,
+                                &killer_identity_skipped,
                                 pidfd,
                                 pid,
                                 uid,
@@ -317,11 +353,22 @@ impl Gate {
             blocked,
             stats,
             blocked_set,
+            identity,
             attached,
             kill_skipped,
+            identity_skipped,
             wake_fd: write_fd,
             handle: Some(handle),
         })
+    }
+
+    /// Replace the "which package names are blocked for this uid" index. The
+    /// engine refreshes it every tick; the killer thread reads it before sending
+    /// a signal, so a uid that was recycled by a newly installed app is never hit.
+    pub fn set_block_index(&mut self, index: StdHashMap<u32, Vec<String>>) {
+        if let Ok(mut slot) = self.identity.lock() {
+            *slot = index;
+        }
     }
 
     pub fn set_blocked(&mut self, uid: u32, blocked: bool) -> anyhow::Result<()> {
@@ -343,6 +390,7 @@ impl Gate {
     pub fn health(&self) -> GateHealth {
         let mut h = self.attached;
         h.kill_skipped = self.kill_skipped.load(Ordering::Relaxed);
+        h.identity_skipped = self.identity_skipped.load(Ordering::Relaxed);
         let read = |idx: u32| -> u64 {
             match self.stats.get(&idx, 0) {
                 Ok(values) => values.iter().copied().sum(),
@@ -359,25 +407,59 @@ impl Gate {
     }
 }
 
-/// Kill only if the uid is still on the block list, and always close the pidfd.
-/// The gate's kernel-side mark can outlive the rule (the process may be killed
-/// by a sweep or a transition before its kretprobe runs), so the userspace side
-/// re-checks: a kill must never land on an app the user did not block.
+/// Decide whether the queued kill may be sent, and always close the pidfd.
+///
+/// Two checks, both about "the kernel's word is not enough on its own":
+///  * the uid must still be on the block list - the gate's mark can outlive the
+///    rule (the process may be killed by a sweep or a transition before its
+///    kretprobe runs);
+///  * the process must actually be one of the blocked packages for that uid, read
+///    from the process's own cmdline. This is what keeps a freshly installed app
+///    that inherited a recycled uid from being killed, and it means the decision
+///    never depends on `/data/system/packages.list`, its format or how Android
+///    hands out uids.
+///
+/// When the cmdline cannot be read (the process is already gone), the uid verdict
+/// stands: the kernel event came from the block map, and a gone process cannot be
+/// signalled anyway.
 fn kill_if_blocked(
     set: &Arc<Mutex<StdHashMap<u32, u8>>>,
     skipped: &Arc<AtomicU64>,
+    identity: &IdentityIndex,
+    identity_skipped: &Arc<AtomicU64>,
     pidfd: i32,
     pid: u32,
     uid: u32,
 ) -> bool {
-    if proc::uid_in(set, uid) {
-        proc::pidfd_kill(pidfd);
-        true
-    } else {
+    if !proc::uid_in(set, uid) {
         skipped.fetch_add(1, Ordering::Relaxed);
         proc::close(pidfd);
         log(&format!("[gate] skip pid={pid} uid={uid} (no longer blocked)"));
-        false
+        return false;
+    }
+    if !identity_ok(identity, pid, uid) {
+        identity_skipped.fetch_add(1, Ordering::Relaxed);
+        proc::close(pidfd);
+        log(&format!("[gate] skip pid={pid} uid={uid} (different app for this uid)"));
+        return false;
+    }
+    proc::pidfd_kill(pidfd);
+    true
+}
+
+/// Is this pid one of the packages the user blocked for this uid?
+fn identity_ok(identity: &IdentityIndex, pid: u32, uid: u32) -> bool {
+    let names = match identity.lock() {
+        Ok(index) => index.get(&uid).cloned(),
+        Err(_) => None,
+    };
+    let Some(names) = names else {
+        // No names recorded for the uid: nothing to confirm against.
+        return false;
+    };
+    match proc::pkg_of_pid(pid) {
+        Some(pkg) => names.iter().any(|n| n == &pkg),
+        None => true,
     }
 }
 

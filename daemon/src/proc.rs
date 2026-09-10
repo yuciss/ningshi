@@ -75,3 +75,60 @@ pub fn kill_pid_if_uid(pid: i32, uid: u32) -> bool {
 pub fn uid_in(set: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, u8>>>, uid: u32) -> bool {
     set.lock().map(|s| s.contains_key(&uid)).unwrap_or(false)
 }
+
+/// Package name carried by a process's own cmdline.
+///
+/// Android sets an app process's argv[0] to its package name (a secondary
+/// process is "com.foo:remote"), so the process itself answers "who am I" without
+/// consulting any system file. That is what makes the block decision independent
+/// of `/data/system/packages.list`, its format, its appId column and how uids are
+/// allocated - and it is what stops a freshly installed app that inherited a
+/// recycled uid from being killed.
+pub fn pkg_from_cmdline(raw: &[u8]) -> Option<String> {
+    let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
+    let argv0 = &raw[..end];
+    if argv0.is_empty() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(argv0);
+    // "com.foo:remote" -> "com.foo"; drop the helper suffix only.
+    let pkg = name.split(':').next().unwrap_or(&name).trim();
+    if pkg.is_empty() {
+        return None;
+    }
+    Some(pkg.to_string())
+}
+
+/// The package name of a running process, or None when it cannot be read
+/// (already gone, or not an Android app process at all).
+pub fn pkg_of_pid(pid: u32) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    pkg_from_cmdline(&raw)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pkg_from_cmdline;
+
+    #[test]
+    fn reads_the_package_name() {
+        assert_eq!(pkg_from_cmdline(b"com.example.app\0").as_deref(), Some("com.example.app"));
+        assert_eq!(pkg_from_cmdline(b"com.example.app\0--flag\0").as_deref(), Some("com.example.app"));
+    }
+
+    #[test]
+    fn strips_a_secondary_process_suffix() {
+        assert_eq!(pkg_from_cmdline(b"com.example.app:remote\0").as_deref(), Some("com.example.app"));
+        assert_eq!(pkg_from_cmdline(b"com.example.app:service\0").as_deref(), Some("com.example.app"));
+    }
+
+    #[test]
+    fn rejects_what_is_not_a_package() {
+        // Kernel threads have an empty cmdline; other programs carry their own
+        // argv[0], which simply will not match any rule.
+        assert_eq!(pkg_from_cmdline(b""), None);
+        assert_eq!(pkg_from_cmdline(b"\0"), None);
+        assert_eq!(pkg_from_cmdline(b"\0--flag\0"), None);
+        assert_eq!(pkg_from_cmdline(b"sh\0").as_deref(), Some("sh"));
+    }
+}

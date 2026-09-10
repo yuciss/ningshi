@@ -2,7 +2,7 @@
 
 # 凝时
 
-**版本 0.4.2**
+**版本 0.4.3**
 
 凝时（Ningshi）是一个 KernelSU 模块。它可以帮你少刷手机，或者防止应用偷跑。
 
@@ -92,7 +92,8 @@ ningshi clear_log
 
 ### 关键设计
 
-- **拦截**：两个互相独立的内核锚点，任意一个可用即可工作。kprobe 挂在 `binder_transaction` 入口按 uid 判黑，第一个 handle≠0 的事务（`attachApplication`）标记 tgid，kretprobe 发出事件；另一个 kretprobe 挂在 `__arm64_sys_setresuid`，进程刚切到被封禁的 uid 就上报——这条链路不依赖 binder 内部实现，也能覆盖从不与 binder 说话、以及内核里 `binder_transaction` 缺失或被内联的情况。用户态 killer 等到进程成为前台（`oom_score_adj == 0`，即 attach 握手完成）后，经 pidfd 发送 `SIGKILL`——被回收的 pid 无法让击杀落错目标；发送前还会再核对一次封禁名单，因为内核侧的标记可能比规则活得更久。
+- **拦截**：两个互相独立的内核锚点，任意一个可用即可工作；具体挂哪个符号由**探测当前内核实际有什么**决定（结果见 `status.gate.uid_switch_symbol`）。`commit_creds` 的 kretprobe 负责"进程刚切到被封 uid"——Linux 里任何一次身份切换都必经它，不管 Android 用哪个系统调用或命名空间机制，挂不上时回退到生成的 `__arm64_sys_setresuid` 包装；`binder_transaction` 的 kprobe/kretprobe 负责"新进程的第一个 handle≠0 事务"。用户态 killer 等到进程成为前台（`oom_score_adj == 0`，即 attach 握手完成）后，经 pidfd 发送 `SIGKILL`——被回收的 pid 无法让击杀落错目标；发送前还会再核对一次封禁名单，因为内核侧的标记可能比规则活得更久。
+- **身份**：内核只回答"某个被封 uid 的进程出现了"。发信号前，killer 会读该进程自己的 `/proc/<pid>/cmdline`，要求它确实带着用户封禁的那个包名——这个名字是进程自己被赋予的，而不是从系统文件里读出来的。于是 `/data/system/packages.list` 只承担"uid 查表"，永远不是"这个进程是谁"的裁判：被新装应用回收的 uid 不可能被误杀（这类跳过计入 `status.gate.identity_skipped`）。
 - **检测**：前台 / 屏状态 / 包名→uid 全部读内核文件系统（cpuset / DRM / `packages.list`）；pid 的 uid 直接取 `/proc/<pid>` 的属主（一次 stat，而不是解析每个进程的 status 文件；已在设备上逐进程核对一致）。
 - **自适应调度**：daemon 只睡到"下一个可能发生变化"的时刻——下一个时间窗边界、延时/冷却到期、本地零点，或在有封禁项时的 60 秒清扫周期。没有任何时间相关规则时进入约 5 分钟的静默睡眠，而且 `/data/system` 里除 `packages.list` 之外的事件一律忽略。启动拦截发生在内核里，所以睡久一点不会削弱拦截。
 - **单实例**：daemon 持有 flock，发现已有实例在跑就直接退出；两个实例会挂上两套钩子、两张互相覆盖的封禁表。

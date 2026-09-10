@@ -13,7 +13,7 @@ use serde_json::json;
 use crate::clear;
 use crate::config::{log, rules_backup_path, rules_path, state_path};
 use crate::fg;
-use crate::gate::{Gate, GateHealth};
+use crate::gate::Gate;
 use crate::pm;
 use crate::rules::{DurationRule, GroupRule, RuleSet, Rules, TimeWindow, RULES_VERSION_MAX};
 
@@ -166,8 +166,6 @@ pub struct Engine {
     screen_off: Option<bool>,
     /// where the active rule set came from (file / backup / built-in default)
     rules_source: RulesSource,
-    /// gate attach state + kernel counters, refreshed every tick
-    gate_health: GateHealth,
     /// interval the loop will sleep with next, for `status`
     last_interval: u64,
     /// daemon start (epoch seconds), for `status.uptime`
@@ -202,7 +200,6 @@ impl Engine {
             protected: HashSet::new(),
             screen_off: None,
             rules_source: RulesSource::Default,
-            gate_health: GateHealth::default(),
             last_interval: ACTIVE_TICK_SECS,
             started: 0,
             last_save: 0,
@@ -478,8 +475,11 @@ impl Engine {
             false
         };
 
-        // Compute the wanted state per uid.
+        // Compute the wanted state per uid, and record which package names are
+        // blocked for each uid: the killer confirms a process's identity from its
+        // own cmdline before signalling, so a recycled uid cannot hit a new app.
         let mut want: HashMap<u32, bool> = HashMap::new();
+        let mut blocked_names: HashMap<u32, Vec<String>> = HashMap::new();
         for (key, app) in &self.rules.apps {
             let Some(&uid) = self.uid_of.get(key) else { continue };
             if uid < 10000 || self.is_protected(key) {
@@ -488,11 +488,14 @@ impl Engine {
             let ext = self.extension_until.get(&uid).is_some_and(|&t| now_epoch < t);
             let over = self.over_duration(&app.rules.duration, uid, None);
             let cool = self.cooldown_until.get(&uid).is_some_and(|&t| now_epoch < t);
-            want.insert(
-                uid,
-                app.enabled
-                    && eval(&app.rules, now_min, weekday, ext, over, cool, screen_off),
-            );
+            let block =
+                app.enabled && eval(&app.rules, now_min, weekday, ext, over, cool, screen_off);
+            want.insert(uid, block);
+            if block {
+                if let Some(pkg) = package_of(key) {
+                    blocked_names.entry(uid).or_default().push(pkg);
+                }
+            }
         }
         for (gid, g) in &self.rules.groups {
             for member in &g.members {
@@ -512,12 +515,21 @@ impl Engine {
                 } else {
                     self.cooldown_until.get(&uid).is_some_and(|&t| now_epoch < t)
                 };
-                want.insert(
-                    uid,
-                    g.enabled && eval(&g.rules, now_min, weekday, ext, over, cool, screen_off),
-                );
+                let block =
+                    g.enabled && eval(&g.rules, now_min, weekday, ext, over, cool, screen_off);
+                want.insert(uid, block);
+                if block {
+                    if let Some(pkg) = package_of(member) {
+                        blocked_names.entry(uid).or_default().push(pkg);
+                    }
+                }
             }
         }
+        for names in blocked_names.values_mut() {
+            names.sort();
+            names.dedup();
+        }
+        self.gate.set_block_index(blocked_names);
 
         // Apply transitions: allowed -> blocked triggers cleanup + notification.
         for (&uid, &should_block) in want.iter() {
@@ -569,9 +581,9 @@ impl Engine {
             self.save_state();
         }
 
-        // Everything `status` needs, gathered once per tick so a status query
-        // stays a pure read.
-        self.gate_health = self.gate.health();
+        // Everything else `status` needs is read on demand: the gate counters
+        // come straight from the kernel maps (a cheap read, not a tick), so a
+        // diagnostic can never be an interval out of date.
         self.last_interval = self.tick_interval_secs();
 
         Ok(())
@@ -818,7 +830,7 @@ impl Engine {
             "interval": self.last_interval,
             "last_tick_age": now.saturating_sub(self.last_tick.unwrap_or(now)),
             "uptime": now.saturating_sub(self.started),
-            "gate": self.gate_health,
+            "gate": self.gate.health(),
             "blocked_uids": self.blocked.iter().copied().collect::<Vec<u32>>(),
             "app_count": self.rules.apps.len(),
             "group_count": self.rules.groups.len(),
@@ -1089,8 +1101,15 @@ fn window_edge_secs(w: &TimeWindow, now_min: u32, weekday: u8, sec_in_min: u64) 
     None
 }
 
-fn parse_hhmm(s: &str) -> u32 {
-    let Some((h, m)) = s.split_once(':') else {
+/// "user:pkg" -> "pkg". This is the identity the killer confirms against the
+/// process's own cmdline.
+fn package_of(key: &str) -> Option<String> {
+    key.split_once(':')
+        .map(|(_, pkg)| pkg.to_string())
+        .filter(|pkg| !pkg.is_empty())
+}
+
+fn parse_hhmm(s: &str) -> u32 {    let Some((h, m)) = s.split_once(':') else {
         return 0;
     };
     let h: u32 = h.parse().unwrap_or(0);
@@ -1328,5 +1347,13 @@ mod tests {
     #[test]
     fn sleep_is_never_zero() {
         assert!(wake_at(NO_RULES, false, vec![], 0, 0) >= 1);
+    }
+
+    #[test]
+    fn package_identity_comes_from_the_key() {
+        assert_eq!(package_of("0:com.example.app").as_deref(), Some("com.example.app"));
+        assert_eq!(package_of("10:com.example.app").as_deref(), Some("com.example.app"));
+        assert_eq!(package_of("nodots"), None);
+        assert_eq!(package_of("0:"), None);
     }
 }
